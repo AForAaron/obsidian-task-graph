@@ -86,6 +86,13 @@ import {
 	sanitizeDocumentTitle,
 	uniqueDocumentPath,
 } from '../services/ContentDocuments';
+import {
+	HistoryConflictError,
+	HistoryEntry,
+	HistoryManager,
+	HistoryMapState,
+	HistorySnapshot,
+} from '../services/HistoryManager';
 
 export const TASK_GRAPH_VIEW = 'task-graph-view';
 
@@ -96,6 +103,16 @@ const STATUS_LABELS: Record<TaskStatus, string> = {
 	canceled: '已取消',
 	custom: '自定义',
 };
+
+interface PendingHistory {
+	mapId: string;
+	label: string;
+	before: HistorySnapshot;
+	mapIds: string[];
+	autoPaths: boolean;
+	vaultWide: boolean;
+	coalesceKey?: string;
+}
 
 export class TaskGraphView extends ItemView {
 	private readonly plugin: TaskGraphPlugin;
@@ -130,10 +147,14 @@ export class TaskGraphView extends ItemView {
 	private editorLoadedMtime = 0;
 	private editorDirty = false;
 	private editorValue = '';
+	private editorBaseContent = '';
 	private ignoreDocumentModifyUntil = 0;
 	private editorLoadGeneration = 0;
 	private documentSavePromise: Promise<void> | null = null;
 	private reloadGeneration = 0;
+	private readonly history = new HistoryManager(50);
+	private undoButton: HTMLButtonElement;
+	private redoButton: HTMLButtonElement;
 
 	constructor(leaf: WorkspaceLeaf, plugin: TaskGraphPlugin) {
 		super(leaf);
@@ -196,16 +217,16 @@ export class TaskGraphView extends ItemView {
 		this.registerEvent(this.app.vault.on('modify', (file) => {
 			const isDocument = file instanceof TFile
 				&& this.activeMap.documents.some((document) => document.path === file.path);
+			if (isDocument && Date.now() < this.ignoreDocumentModifyUntil) return;
 			if (
 				isDocument
 				&& file.path === this.editorDocumentPath
 				&& this.editorDirty
 				&& file.stat.mtime > this.editorLoadedMtime
 			) {
-				new Notice('内容文件已在外部修改；当前快速编辑内容尚未覆盖，请重新载入或打开完整笔记');
+				void this.handleEditorDocumentModified(file);
 				return;
 			}
-			if (isDocument && Date.now() < this.ignoreDocumentModifyUntil) return;
 			if (isDocument) {
 				this.scheduleReload();
 				return;
@@ -226,6 +247,17 @@ export class TaskGraphView extends ItemView {
 				this.scheduleReload();
 			}
 		}));
+		this.registerDomEvent(this.contentEl, 'keydown', (event: KeyboardEvent) => {
+			if (this.isTextEditingTarget(event.target)) return;
+			const key = event.key.toLocaleLowerCase();
+			const modifier = event.metaKey || event.ctrlKey;
+			const redo = modifier && (key === 'y' || (key === 'z' && event.shiftKey));
+			const undo = modifier && key === 'z' && !event.shiftKey;
+			if (!undo && !redo) return;
+			event.preventDefault();
+			if (redo) void this.redo();
+			else void this.undo();
+		});
 
 		await this.reloadMap();
 	}
@@ -300,10 +332,13 @@ export class TaskGraphView extends ItemView {
 		});
 
 		const actions = secondary.createDiv('tgf-toolbar-actions');
+		this.undoButton = this.createIconButton(actions, 'undo-2', '撤销', () => void this.undo());
+		this.redoButton = this.createIconButton(actions, 'redo-2', '重做', () => void this.redo());
 		this.createIconButton(actions, 'minus', '缩小', () => this.graphCanvas?.zoomBy(0.85));
 		this.createIconButton(actions, 'plus', '放大', () => this.graphCanvas?.zoomBy(1.15));
 		this.createIconButton(actions, 'scan', '适应画布', () => this.graphCanvas?.fitView());
 		this.createIconButton(actions, 'refresh-cw', '重新读取任务', () => void this.reloadMap());
+		this.updateHistoryButtons();
 		this.populateMapOptions();
 	}
 
@@ -464,6 +499,7 @@ export class TaskGraphView extends ItemView {
 		this.currentFilePath = '';
 		await this.plugin.persistData();
 		await this.reloadMap();
+		this.updateHistoryButtons();
 	}
 
 	private async manageSources(): Promise<void> {
@@ -537,6 +573,7 @@ export class TaskGraphView extends ItemView {
 		this.graphCanvas?.setViewport(map.viewport);
 		this.renderSourcePanel();
 		this.renderGraph();
+		this.updateHistoryButtons();
 		if (this.shouldFitAfterRender) {
 			this.shouldFitAfterRender = false;
 			window.setTimeout(() => this.graphCanvas?.fitView(), 0);
@@ -828,6 +865,7 @@ export class TaskGraphView extends ItemView {
 	}
 
 	private async organizeGraph(): Promise<void> {
+		const historyBefore = this.mapHistoryState(this.activeMap);
 		const layout = layoutGraph(this.graphData.nodes, this.graphData.edges);
 		const organized = layoutTaskDocuments(
 			layout,
@@ -844,22 +882,281 @@ export class TaskGraphView extends ItemView {
 		});
 		this.activeMap.nodePositions = positions;
 		await this.plugin.persistData();
+		this.recordConfigHistory('规整地图', historyBefore);
 		this.renderGraph();
 		window.setTimeout(() => this.graphCanvas?.fitView(), 0);
 		new Notice('已按任务关系和内容归属重新规整地图');
 	}
 
 	private saveNodePosition(node: PositionedGraphNode, position: NodePosition): void {
+		const historyBefore = this.mapHistoryState(this.activeMap);
 		const key = 'nodeType' in node
 			? documentPositionKey(node.path)
 			: taskPositionKey(node);
 		this.activeMap.nodePositions[key] = position;
+		this.recordConfigHistory('移动节点', historyBefore);
 		this.queueSave();
 	}
 
 	private saveViewport(viewport: ViewportState): void {
 		this.activeMap.viewport = viewport;
 		this.queueSave();
+	}
+
+	private isTextEditingTarget(target: EventTarget | null): boolean {
+		return target instanceof HTMLElement && Boolean(
+			target.closest('input, textarea, [contenteditable="true"]'),
+		);
+	}
+
+	private mapHistoryState(map: TaskMapConfig): HistoryMapState {
+		return {
+			nodePositions: Object.fromEntries(
+				Object.entries(map.nodePositions).map(([key, position]) => [key, { ...position }]),
+			),
+			documents: map.documents.map((document) => ({ ...document })),
+		};
+	}
+
+	private historyPaths(mapIds: string[]): string[] {
+		const paths = new Set<string>();
+		this.plugin.data.maps
+			.filter((map) => mapIds.includes(map.id))
+			.forEach((map) => {
+				resolveMapSources(this.app, map).files.forEach((file) => paths.add(file.path));
+				map.documents.forEach((document) => paths.add(document.path));
+			});
+		return Array.from(paths);
+	}
+
+	private async captureHistorySnapshot(paths: string[], mapIds: string[]): Promise<HistorySnapshot> {
+		const files: Record<string, string | null> = {};
+		const orderedPaths = Array.from(new Set(paths)).sort((a, b) => a.localeCompare(b));
+		const captured = await Promise.all(orderedPaths.map(async (path) => {
+			const file = this.app.vault.getAbstractFileByPath(path);
+			return [path, file instanceof TFile ? await this.app.vault.read(file) : null] as const;
+		}));
+		captured.forEach(([path, content]) => { files[path] = content; });
+		const maps: Record<string, HistoryMapState> = {};
+		mapIds.forEach((mapId) => {
+			const map = this.plugin.data.maps.find((candidate) => candidate.id === mapId);
+			if (map) maps[mapId] = this.mapHistoryState(map);
+		});
+		return { files, maps };
+	}
+
+	private async beginHistory(
+		label: string,
+		options: {
+			allMaps?: boolean;
+			paths?: string[];
+			coalesceKey?: string;
+		} = {},
+	): Promise<PendingHistory> {
+		if (label !== '编辑内容' && this.editorDirty) {
+			await this.flushDocumentEditor();
+		}
+		const mapIds = options.allMaps
+			? this.plugin.data.maps.map((map) => map.id)
+			: [this.activeMap.id];
+		const autoPaths = !options.paths;
+		const vaultWide = Boolean(options.allMaps && autoPaths);
+		const paths = options.paths ?? (
+			vaultWide
+				? this.app.vault.getMarkdownFiles().map((file) => file.path)
+				: this.historyPaths(mapIds)
+		);
+		return {
+			mapId: this.activeMap.id,
+			label,
+			before: await this.captureHistorySnapshot(paths, mapIds),
+			mapIds,
+			autoPaths,
+			vaultWide,
+			coalesceKey: options.coalesceKey,
+		};
+	}
+
+	private compactHistoryEntry(pending: PendingHistory, after: HistorySnapshot): HistoryEntry | null {
+		const beforeFiles: Record<string, string | null> = {};
+		const afterFiles: Record<string, string | null> = {};
+		const filePaths = new Set([
+			...Object.keys(pending.before.files),
+			...Object.keys(after.files),
+		]);
+		filePaths.forEach((path) => {
+			const before = pending.before.files[path] ?? null;
+			const next = after.files[path] ?? null;
+			if (before !== next) {
+				beforeFiles[path] = before;
+				afterFiles[path] = next;
+			}
+		});
+		const beforeMaps: Record<string, HistoryMapState> = {};
+		const afterMaps: Record<string, HistoryMapState> = {};
+		pending.mapIds.forEach((mapId) => {
+			const before = pending.before.maps[mapId];
+			const next = after.maps[mapId];
+			if (before && next && JSON.stringify(before) !== JSON.stringify(next)) {
+				beforeMaps[mapId] = before;
+				afterMaps[mapId] = next;
+			}
+		});
+		if (Object.keys(beforeFiles).length === 0 && Object.keys(beforeMaps).length === 0) return null;
+		return {
+			label: pending.label,
+			before: { files: beforeFiles, maps: beforeMaps },
+			after: { files: afterFiles, maps: afterMaps },
+			coalesceKey: pending.coalesceKey,
+		};
+	}
+
+	private async commitHistory(pending: PendingHistory): Promise<void> {
+		const currentPaths = pending.autoPaths
+			? pending.vaultWide
+				? this.app.vault.getMarkdownFiles().map((file) => file.path)
+				: this.historyPaths(pending.mapIds)
+			: [];
+		const paths = Array.from(new Set([
+			...Object.keys(pending.before.files),
+			...currentPaths,
+		]));
+		const after = await this.captureHistorySnapshot(paths, pending.mapIds);
+		paths.forEach((path) => {
+			if (!(path in pending.before.files)) pending.before.files[path] = null;
+		});
+		const entry = this.compactHistoryEntry(pending, after);
+		if (!entry) return;
+		this.history.record(pending.mapId, entry);
+		this.updateHistoryButtons();
+	}
+
+	private recordConfigHistory(
+		label: string,
+		before: HistoryMapState,
+		coalesceKey?: string,
+	): void {
+		const after = this.mapHistoryState(this.activeMap);
+		if (JSON.stringify(before) === JSON.stringify(after)) return;
+		this.history.record(this.activeMap.id, {
+			label,
+			before: { files: {}, maps: { [this.activeMap.id]: before } },
+			after: { files: {}, maps: { [this.activeMap.id]: after } },
+			coalesceKey,
+		});
+		this.updateHistoryButtons();
+	}
+
+	private snapshotsEqual(a: HistorySnapshot, b: HistorySnapshot): boolean {
+		return JSON.stringify(a) === JSON.stringify(b);
+	}
+
+	private async writeHistoryFiles(files: Record<string, string | null>): Promise<void> {
+		const deletions = Object.entries(files).filter(([, content]) => content === null);
+		const writes = Object.entries(files).filter(([, content]) => content !== null);
+		for (const [path] of deletions) {
+			const file = this.app.vault.getAbstractFileByPath(path);
+			if (file instanceof TFile) await this.app.vault.delete(file);
+		}
+		for (const [path, content] of writes) {
+			const file = this.app.vault.getAbstractFileByPath(path);
+			if (file instanceof TFile) await this.app.vault.modify(file, content!);
+			else if (!file) await this.app.vault.create(path, content!);
+			else throw new Error(`无法恢复文件，路径被文件夹占用：${path}`);
+		}
+	}
+
+	private applyHistoryMaps(maps: Record<string, HistoryMapState>): void {
+		Object.entries(maps).forEach(([mapId, state]) => {
+			const map = this.plugin.data.maps.find((candidate) => candidate.id === mapId);
+			if (!map) throw new Error(`找不到历史记录所属地图：${mapId}`);
+			map.nodePositions = Object.fromEntries(
+				Object.entries(state.nodePositions).map(([key, position]) => [key, { ...position }]),
+			);
+			map.documents = state.documents.map((document) => ({ ...document }));
+		});
+	}
+
+	private async applyHistorySnapshot(
+		expected: HistorySnapshot,
+		target: HistorySnapshot,
+	): Promise<void> {
+		const paths = Object.keys(expected.files);
+		const mapIds = Object.keys(expected.maps);
+		const current = await this.captureHistorySnapshot(paths, mapIds);
+		if (!this.snapshotsEqual(current, expected)) {
+			throw new HistoryConflictError('文件或地图布局已被其他操作修改，未执行撤销以避免覆盖新内容');
+		}
+		try {
+			await this.writeHistoryFiles(target.files);
+			this.applyHistoryMaps(target.maps);
+			await this.plugin.persistData();
+		} catch (error) {
+			try {
+				await this.writeHistoryFiles(current.files);
+				this.applyHistoryMaps(current.maps);
+				await this.plugin.persistData();
+			} catch (rollbackError) {
+				const message = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
+				throw new Error(`恢复操作失败，且自动回滚未完成：${message}`);
+			}
+			throw error;
+		}
+	}
+
+	private updateHistoryButtons(): void {
+		if (!this.undoButton || !this.redoButton) return;
+		const mapId = this.activeMap.id;
+		const undoLabel = this.history.undoLabel(mapId);
+		const redoLabel = this.history.redoLabel(mapId);
+		this.undoButton.disabled = !undoLabel;
+		this.redoButton.disabled = !redoLabel;
+		this.undoButton.setAttribute('aria-label', undoLabel ? `撤销：${undoLabel}` : '没有可撤销的操作');
+		this.undoButton.setAttribute('title', undoLabel ? `撤销：${undoLabel} (⌘/Ctrl+Z)` : '没有可撤销的操作');
+		this.redoButton.setAttribute('aria-label', redoLabel ? `重做：${redoLabel}` : '没有可重做的操作');
+		this.redoButton.setAttribute('title', redoLabel ? `重做：${redoLabel} (⌘/Ctrl+Shift+Z)` : '没有可重做的操作');
+	}
+
+	public canUndo(): boolean {
+		return this.history.canUndo(this.activeMap.id);
+	}
+
+	public canRedo(): boolean {
+		return this.history.canRedo(this.activeMap.id);
+	}
+
+	public async undo(): Promise<void> {
+		if (!await this.flushDocumentEditor()) return;
+		try {
+			const entry = await this.history.undo(
+				this.activeMap.id,
+				(expected, target) => this.applyHistorySnapshot(expected, target),
+			);
+			if (!entry) return;
+			await this.reloadMap();
+			new Notice(`已撤销：${entry.label}`);
+		} catch (error) {
+			this.showError(error, '撤销失败');
+		} finally {
+			this.updateHistoryButtons();
+		}
+	}
+
+	public async redo(): Promise<void> {
+		if (!await this.flushDocumentEditor()) return;
+		try {
+			const entry = await this.history.redo(
+				this.activeMap.id,
+				(expected, target) => this.applyHistorySnapshot(expected, target),
+			);
+			if (!entry) return;
+			await this.reloadMap();
+			new Notice(`已重做：${entry.label}`);
+		} catch (error) {
+			this.showError(error, '重做失败');
+		} finally {
+			this.updateHistoryButtons();
+		}
 	}
 
 	private queueSave(): void {
@@ -1109,12 +1406,13 @@ export class TaskGraphView extends ItemView {
 				|| this.selectedId !== document.id
 				|| this.editorDocumentPath !== document.path
 				|| this.editorDirty
-			) return;
-			this.editorValue = content;
-			textarea.value = content;
-			textarea.disabled = false;
-			status.setText('已保存');
-		}).catch((error) => {
+				) return;
+				this.editorValue = content;
+				this.editorBaseContent = content;
+				textarea.value = content;
+				textarea.disabled = false;
+				status.setText('已保存');
+			}).catch((error) => {
 			if (loadGeneration !== this.editorLoadGeneration) return;
 			textarea.disabled = true;
 			status.setText('读取失败');
@@ -1194,10 +1492,22 @@ export class TaskGraphView extends ItemView {
 			return;
 		}
 		if (file.stat.mtime > loadedMtime) {
-			status?.setText('检测到外部修改，未覆盖');
-			new Notice('内容文件已被外部修改，请重新载入或打开完整笔记处理冲突');
-			return;
+			const currentContent = await this.app.vault.read(file);
+			if (currentContent === value) {
+				this.markEditorSaved(file, value, status);
+				return;
+			}
+			if (currentContent !== this.editorBaseContent) {
+				status?.setText('检测到外部修改，未覆盖');
+				new Notice('内容文件已被外部修改，请重新载入或打开完整笔记处理冲突');
+				return;
+			}
+			this.editorLoadedMtime = file.stat.mtime;
 		}
+		const history = await this.beginHistory('编辑内容', {
+			paths: [path],
+			coalesceKey: `document-editor:${path}:${this.editorLoadGeneration}`,
+		});
 		this.editorDirty = false;
 		status?.setText('正在保存…');
 		const savePromise = (async () => {
@@ -1208,9 +1518,11 @@ export class TaskGraphView extends ItemView {
 				const node = this.documentNodes.find((item) => item.path === file.path);
 				if (node) Object.assign(node, stats, { mtime: file.stat.mtime });
 				if (this.editorDocumentPath === path) {
+					this.editorBaseContent = value;
 					this.editorLoadedMtime = file.stat.mtime;
 					status?.setText(this.editorDirty ? '未保存' : '已保存');
 				}
+				await this.commitHistory(history);
 			} catch (error) {
 				if (this.editorDocumentPath === path) this.editorDirty = true;
 				status?.setText('保存失败');
@@ -1225,9 +1537,38 @@ export class TaskGraphView extends ItemView {
 		}
 	}
 
-	private async flushDocumentEditor(): Promise<boolean> {
-		if (this.documentSaveTimer !== null) {
-			window.clearTimeout(this.documentSaveTimer);
+	private async handleEditorDocumentModified(file: TFile): Promise<void> {
+		try {
+			const currentContent = await this.app.vault.read(file);
+			if (file.path !== this.editorDocumentPath || !this.editorDirty) return;
+			if (currentContent === this.editorValue) {
+				this.markEditorSaved(file, currentContent);
+				return;
+			}
+			if (currentContent === this.editorBaseContent) {
+				this.editorLoadedMtime = file.stat.mtime;
+				return;
+			}
+			new Notice('内容文件已在外部修改；当前快速编辑内容尚未覆盖，请重新载入或打开完整笔记');
+		} catch (error) {
+			this.showError(error, '检查内容文件修改失败');
+		}
+	}
+
+	private markEditorSaved(file: TFile, content: string, status?: HTMLElement): void {
+		this.editorDirty = false;
+		this.editorValue = content;
+		this.editorBaseContent = content;
+		this.editorLoadedMtime = file.stat.mtime;
+		const stats = calculateDocumentStats(content);
+		const node = this.documentNodes.find((item) => item.path === file.path);
+		if (node) Object.assign(node, stats, { mtime: file.stat.mtime });
+		status?.setText('已保存');
+	}
+	
+		private async flushDocumentEditor(): Promise<boolean> {
+			if (this.documentSaveTimer !== null) {
+				window.clearTimeout(this.documentSaveTimer);
 			this.documentSaveTimer = null;
 		}
 		await this.saveDocumentEditor();
@@ -1242,6 +1583,7 @@ export class TaskGraphView extends ItemView {
 		this.editorLoadedMtime = 0;
 		this.editorDirty = false;
 		this.editorValue = '';
+		this.editorBaseContent = '';
 	}
 
 	private async closeDocumentInspector(): Promise<void> {
@@ -1353,6 +1695,7 @@ export class TaskGraphView extends ItemView {
 		const taskLine = await api.createTaskLineModal();
 		if (!taskLine) return;
 		const prepared = prepareNewTaskLine(taskLine, this.nextTaskId());
+		const history = await this.beginHistory('创建任务');
 		try {
 			const file = await this.writeNewTask(target, prepared.line);
 			const parsed = parseTaskFile(file.path, prepared.line)[0];
@@ -1363,6 +1706,7 @@ export class TaskGraphView extends ItemView {
 			this.currentFilePath = file.path;
 			await this.plugin.persistData();
 			await this.reloadMap();
+			await this.commitHistory(history);
 			new Notice('任务已添加到地图');
 		} catch (error) {
 			this.showError(error, '创建任务失败');
@@ -1377,6 +1721,7 @@ export class TaskGraphView extends ItemView {
 		const title = await requestTextValue(this.app, '新建内容文件', '文件标题', '例如：第二步方案');
 		if (!title) return;
 		let createdFile: TFile | null = null;
+		const history = await this.beginHistory('创建内容文件');
 		try {
 			const file = await createContentDocument(this.app, this.currentFilePath, title);
 			createdFile = file;
@@ -1388,6 +1733,7 @@ export class TaskGraphView extends ItemView {
 			await this.reloadMap();
 			const document = this.documentNodes.find((item) => item.path === file.path);
 			if (document) this.selectDocument(document);
+			await this.commitHistory(history);
 			new Notice('内容文件已创建');
 		} catch (error) {
 			if (createdFile) {
@@ -1408,6 +1754,7 @@ export class TaskGraphView extends ItemView {
 	): Promise<void> {
 		let createdFile: TFile | null = null;
 		let linkedTask: TaskNode | null = null;
+		const history = await this.beginHistory('创建并关联任务内容');
 		try {
 			let currentTask = task;
 			if (!currentTask.taskId) {
@@ -1443,6 +1790,7 @@ export class TaskGraphView extends ItemView {
 			await this.reloadMap();
 			const document = this.documentNodes.find((item) => item.path === file.path);
 			if (document) this.selectDocument(document);
+			await this.commitHistory(history);
 			new Notice('任务内容已创建并关联');
 		} catch (error) {
 			if (linkedTask && createdFile) {
@@ -1500,6 +1848,7 @@ export class TaskGraphView extends ItemView {
 			documents: map.documents.map((item) => ({ ...item })),
 			nodePositions: { ...map.nodePositions },
 		}));
+		const history = await this.beginHistory('建立内容关联', { allMaps: true });
 		try {
 			const file = this.app.vault.getAbstractFileByPath(path);
 			if (!(file instanceof TFile)) throw new Error(`找不到内容文件：${path}`);
@@ -1539,6 +1888,7 @@ export class TaskGraphView extends ItemView {
 			await this.restoreTaskPosition(task, oldTaskKey, oldTaskPosition);
 			const updated = this.documentNodes.find((item) => item.path === path);
 			if (updated) this.selectDocument(updated);
+			await this.commitHistory(history);
 			new Notice('内容关联已建立');
 		} catch (error) {
 			if (linkWritten) {
@@ -1574,12 +1924,14 @@ export class TaskGraphView extends ItemView {
 	private async unlinkDocumentFromTask(task: TaskNode, document: DocumentNode): Promise<void> {
 		const oldKey = taskPositionKey(task);
 		const oldPosition = this.activeMap.nodePositions[oldKey];
+		const history = await this.beginHistory('解除内容关联');
 		try {
 			await changeTaskDocumentLink(this.app, task, document.path, false);
 			await this.reloadMap();
 			await this.restoreTaskPosition(task, oldKey, oldPosition);
 			const updated = this.documentNodes.find((item) => item.path === document.path);
 			if (updated) this.selectDocument(updated);
+			await this.commitHistory(history);
 			new Notice('内容关联已解除，文件仍然保留');
 		} catch (error) {
 			this.showError(error, '解除内容关联失败');
@@ -1587,7 +1939,9 @@ export class TaskGraphView extends ItemView {
 	}
 
 	private expandAndSelectDocument(document: DocumentNode): void {
+		const historyBefore = this.mapHistoryState(this.activeMap);
 		registerDocument(this.activeMap, document.path, true);
+		this.recordConfigHistory('展开内容卡', historyBefore);
 		this.queueSave();
 		this.renderGraph();
 		const updated = this.documentNodes.find((item) => item.path === document.path);
@@ -1596,12 +1950,14 @@ export class TaskGraphView extends ItemView {
 
 	private async removeDocumentFromCanvas(document: DocumentNode): Promise<void> {
 		if (!await this.flushDocumentEditor()) return;
+		const historyBefore = this.mapHistoryState(this.activeMap);
 		const config = this.activeMap.documents.find((item) => item.path === document.path);
 		if (config) config.expanded = false;
 		delete this.activeMap.nodePositions[documentPositionKey(document.path)];
 		this.selectedId = null;
 		this.resetDocumentEditorState();
 		await this.plugin.persistData();
+		this.recordConfigHistory('收起内容卡', historyBefore);
 		this.renderGraph();
 		new Notice('内容卡已从画布收起，文件和任务关联均未删除');
 	}
@@ -1635,6 +1991,7 @@ export class TaskGraphView extends ItemView {
 			documents: map.documents.map((item) => ({ ...item })),
 			nodePositions: { ...map.nodePositions },
 		}));
+		const history = await this.beginHistory('重命名内容文件', { allMaps: true });
 		try {
 			if (!await this.flushDocumentEditor()) return;
 			const linkedTasks = document.linkedTaskIds
@@ -1656,6 +2013,7 @@ export class TaskGraphView extends ItemView {
 			await this.reloadMap();
 			const updated = this.documentNodes.find((item) => item.path === target);
 			if (updated) this.selectDocument(updated);
+			await this.commitHistory(history);
 		} catch (error) {
 			const renamedFile = this.app.vault.getAbstractFileByPath(target);
 			if (
@@ -1685,7 +2043,7 @@ export class TaskGraphView extends ItemView {
 		const confirmed = await confirmAction(
 			this.app,
 			'删除内容文件？',
-			`将删除“${document.title}”并从 ${document.linkedTaskIds.length} 个任务中清理关联。此操作不可在 Task Graph 中撤销。`,
+			`将删除“${document.title}”并从 ${document.linkedTaskIds.length} 个任务中清理关联。此操作可在当前会话中撤销。`,
 			'删除文件',
 			true,
 		);
@@ -1697,6 +2055,7 @@ export class TaskGraphView extends ItemView {
 			documents: map.documents.map((item) => ({ ...item })),
 			nodePositions: { ...map.nodePositions },
 		}));
+		const history = await this.beginHistory('删除内容文件', { allMaps: true });
 		try {
 			if (!await this.flushDocumentEditor()) return;
 			const changes = document.linkedTaskIds
@@ -1715,6 +2074,7 @@ export class TaskGraphView extends ItemView {
 			this.selectedId = null;
 			this.resetDocumentEditorState();
 			await this.reloadMap();
+			await this.commitHistory(history);
 			new Notice('内容文件已删除');
 		} catch (error) {
 			mapSnapshots.forEach(({ map, documents, nodePositions }) => {
@@ -1742,6 +2102,7 @@ export class TaskGraphView extends ItemView {
 			documents: map.documents.map((item) => ({ ...item })),
 			nodePositions: { ...map.nodePositions },
 		}));
+		const history = await this.beginHistory('重新绑定内容文件', { allMaps: true });
 		try {
 			const linkedTasks = document.linkedTaskIds
 				.map((taskId) => this.graphData.nodes.find((node) => node.id === taskId))
@@ -1761,6 +2122,7 @@ export class TaskGraphView extends ItemView {
 			await this.reloadMap();
 			const updated = this.documentNodes.find((item) => item.path === file.path);
 			if (updated) this.selectDocument(updated);
+			await this.commitHistory(history);
 		} catch (error) {
 			mapSnapshots.forEach(({ map, documents, nodePositions }) => {
 				map.documents = documents;
@@ -1814,6 +2176,7 @@ export class TaskGraphView extends ItemView {
 		const parentPosition = this.activeMap.nodePositions[oldParentKey];
 		let targetFile = target.file;
 		let createdFile: TFile | null = null;
+		const history = await this.beginHistory('创建后续任务');
 		try {
 			if (!targetFile && target.newPath) {
 				createdFile = await this.app.vault.create(target.newPath, '');
@@ -1849,6 +2212,7 @@ export class TaskGraphView extends ItemView {
 			await this.plugin.persistData();
 			this.renderSourcePanel();
 			this.renderGraph();
+			await this.commitHistory(history);
 			new Notice('后续任务已创建');
 		} catch (error) {
 			if (createdFile) {
@@ -1884,6 +2248,7 @@ export class TaskGraphView extends ItemView {
 		const childPosition = this.activeMap.nodePositions[oldChildKey];
 		let targetFile = target.file;
 		let createdFile: TFile | null = null;
+		const history = await this.beginHistory('创建前置任务');
 		try {
 			if (!targetFile && target.newPath) {
 				createdFile = await this.app.vault.create(target.newPath, '');
@@ -1919,6 +2284,7 @@ export class TaskGraphView extends ItemView {
 			await this.plugin.persistData();
 			this.renderSourcePanel();
 			this.renderGraph();
+			await this.commitHistory(history);
 			new Notice('前置任务已创建');
 		} catch (error) {
 			if (createdFile) {
@@ -1977,6 +2343,7 @@ export class TaskGraphView extends ItemView {
 		const used = new Set(this.graphData.nodes.flatMap((node) => node.taskId ? [node.taskId] : []));
 		used.add(parentCandidate);
 		const childCandidate = child.taskId ?? createTaskId(used);
+		const history = await this.beginHistory('建立任务关系');
 		try {
 			const result = await connectTasks(
 				this.app,
@@ -1995,6 +2362,7 @@ export class TaskGraphView extends ItemView {
 			}
 			await this.plugin.persistData();
 			await this.reloadMap();
+			await this.commitHistory(history);
 			new Notice('任务关系已建立');
 		} catch (error) {
 			this.showError(error, '建立任务关系失败');
@@ -2010,9 +2378,11 @@ export class TaskGraphView extends ItemView {
 			false,
 		);
 		if (!confirmed) return;
+		const history = await this.beginHistory('解除任务关系');
 		try {
 			await removeTaskRelationship(this.app, parent, child);
 			await this.reloadMap();
+			await this.commitHistory(history);
 			new Notice('任务关系已解除');
 		} catch (error) {
 			this.showError(error, '解除任务关系失败');
@@ -2098,6 +2468,7 @@ export class TaskGraphView extends ItemView {
 				: task.blockedByIds.length > 0
 					? ensureTaskId(editedLine, this.nextTaskId()).line
 					: editedLine;
+			const history = await this.beginHistory('编辑任务');
 			const oldKey = taskPositionKey(task);
 			const oldPosition = this.activeMap.nodePositions[oldKey];
 			await replaceTaskLine(this.app, task, protectedLine);
@@ -2109,6 +2480,7 @@ export class TaskGraphView extends ItemView {
 			}
 			await this.plugin.persistData();
 			await this.reloadMap();
+			await this.commitHistory(history);
 			new Notice('任务已更新');
 		} catch (error) {
 			this.showError(error, '编辑任务失败');
@@ -2119,6 +2491,7 @@ export class TaskGraphView extends ItemView {
 		const candidate = this.nextTaskId();
 		const oldKey = taskPositionKey(task);
 		const oldPosition = this.activeMap.nodePositions[oldKey];
+		const history = await this.beginHistory('生成任务 ID');
 		try {
 			await assignTaskId(this.app, task, candidate, Boolean(task.taskId));
 			if (oldPosition) {
@@ -2129,6 +2502,7 @@ export class TaskGraphView extends ItemView {
 			await this.reloadMap();
 			const updated = this.graphData.nodes.find((node) => node.taskId === candidate);
 			if (updated) this.selectNode(updated as PositionedTaskNode);
+			await this.commitHistory(history);
 			new Notice(`任务 ID 已生成：${candidate}`);
 		} catch (error) {
 			this.showError(error, '生成任务 ID 失败');
@@ -2148,6 +2522,7 @@ export class TaskGraphView extends ItemView {
 			task.id,
 			{ key: taskPositionKey(task), position: this.activeMap.nodePositions[taskPositionKey(task)] },
 		]));
+		const history = await this.beginHistory('修复任务 ID');
 		try {
 			const assigned = await repairTaskIds(
 				this.app,
@@ -2162,6 +2537,7 @@ export class TaskGraphView extends ItemView {
 			});
 			await this.plugin.persistData();
 			await this.reloadMap();
+			await this.commitHistory(history);
 			new Notice(`已修复 ${assigned.size} 个任务 ID`);
 		} catch (error) {
 			this.showError(error, '批量修复任务 ID 失败');
@@ -2171,10 +2547,12 @@ export class TaskGraphView extends ItemView {
 	private async toggleStar(task: TaskNode): Promise<void> {
 		const oldKey = taskPositionKey(task);
 		const oldPosition = this.activeMap.nodePositions[oldKey];
+		const history = await this.beginHistory(task.starred ? '取消星标' : '添加星标');
 		try {
 			await setTaskStar(this.app, task, !task.starred);
 			await this.reloadMap();
 			await this.restoreTaskPosition(task, oldKey, oldPosition);
+			await this.commitHistory(history);
 		} catch (error) {
 			this.showError(error, '更新星标失败');
 		}
@@ -2185,10 +2563,12 @@ export class TaskGraphView extends ItemView {
 		if (!tag) return;
 		const oldKey = taskPositionKey(task);
 		const oldPosition = this.activeMap.nodePositions[oldKey];
+		const history = await this.beginHistory('添加标签');
 		try {
 			await changeTaskTag(this.app, task, tag, true);
 			await this.reloadMap();
 			await this.restoreTaskPosition(task, oldKey, oldPosition);
+			await this.commitHistory(history);
 		} catch (error) {
 			this.showError(error, '添加标签失败');
 		}
@@ -2197,10 +2577,12 @@ export class TaskGraphView extends ItemView {
 	private async removeTag(task: TaskNode, tag: string): Promise<void> {
 		const oldKey = taskPositionKey(task);
 		const oldPosition = this.activeMap.nodePositions[oldKey];
+		const history = await this.beginHistory('移除标签');
 		try {
 			await changeTaskTag(this.app, task, tag, false);
 			await this.reloadMap();
 			await this.restoreTaskPosition(task, oldKey, oldPosition);
+			await this.commitHistory(history);
 		} catch (error) {
 			this.showError(error, '移除标签失败');
 		}
@@ -2212,15 +2594,17 @@ export class TaskGraphView extends ItemView {
 			: [];
 		const description = dependents.length > 0
 			? `将删除“${task.text}”，并从 ${dependents.length} 个后续任务中解除对应依赖。此操作会修改笔记原文。`
-			: `将从笔记中删除“${task.text}”。此操作无法在 Task Graph 中撤销。`;
+			: `将从笔记中删除“${task.text}”。此操作可在当前会话中撤销。`;
 		const confirmed = await confirmAction(this.app, '删除任务？', description);
 		if (!confirmed) return;
+		const history = await this.beginHistory('删除任务');
 		try {
 			await deleteTaskAndReferences(this.app, task, dependents);
 			delete this.activeMap.nodePositions[taskPositionKey(task)];
 			this.selectedId = null;
 			await this.plugin.persistData();
 			await this.reloadMap();
+			await this.commitHistory(history);
 			new Notice('任务已删除');
 		} catch (error) {
 			this.showError(error, '删除任务失败');
@@ -2256,6 +2640,7 @@ export class TaskGraphView extends ItemView {
 		}
 		const oldKey = taskPositionKey(task);
 		const oldPosition = this.activeMap.nodePositions[oldKey];
+		const history = await this.beginHistory('更新任务状态');
 		try {
 			if (task.status === 'todo') {
 				await markTaskInProgress(this.app, task);
@@ -2278,6 +2663,7 @@ export class TaskGraphView extends ItemView {
 			}
 			await this.reloadMap();
 			await this.restoreTaskPosition(task, oldKey, oldPosition);
+			await this.commitHistory(history);
 		} catch (error) {
 			this.showError(error, '任务更新失败');
 		}
