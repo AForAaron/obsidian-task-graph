@@ -6,6 +6,7 @@ const COLUMN_GAP = 104;
 const ROW_GAP = 34;
 const PADDING = 72;
 const ISOLATED_COLUMNS = 3;
+const COMPONENT_GAP = 120;
 
 export interface LayoutResult {
 	nodes: PositionedTaskNode[];
@@ -38,42 +39,70 @@ export function layoutGraph(nodes: DerivedTaskNode[], edges: TaskEdge[]): Layout
 		.sort(compareTaskOrder);
 	const cycleIds = new Set(nodes.filter((node) => node.warnings.includes('cycle')).map((node) => node.id));
 
-	const incoming = new Map<string, string[]>();
-	connected.forEach((node) => incoming.set(node.id, []));
-	validEdges
-		.filter((edge) => !cycleIds.has(edge.sourceId) && !cycleIds.has(edge.targetId))
-		.forEach((edge) => incoming.get(edge.targetId)?.push(edge.sourceId));
-
-	const layerById = new Map<string, number>();
-	const resolveLayer = (id: string): number => {
-		const existing = layerById.get(id);
-		if (existing !== undefined) return existing;
-		const dependencies = incoming.get(id) ?? [];
-		const layer = dependencies.length === 0
-			? 0
-			: Math.max(...dependencies.map((dependencyId) => resolveLayer(dependencyId))) + 1;
-		layerById.set(id, layer);
-		return layer;
-	};
-	connected.filter((node) => !cycleIds.has(node.id)).forEach((node) => resolveLayer(node.id));
-	const maxNormalLayer = Math.max(0, ...Array.from(layerById.values()));
-	connected.filter((node) => cycleIds.has(node.id)).forEach((node) => {
-		layerById.set(node.id, maxNormalLayer + 1);
+	const positioned: PositionedTaskNode[] = [];
+	const nodeById = new Map(connected.map((node) => [node.id, node]));
+	const neighbors = new Map(connected.map((node) => [node.id, [] as string[]]));
+	validEdges.forEach((edge) => {
+		neighbors.get(edge.sourceId)?.push(edge.targetId);
+		neighbors.get(edge.targetId)?.push(edge.sourceId);
 	});
+	const remaining = new Set(connected.map((node) => node.id));
+	const components: DerivedTaskNode[][] = [];
+	while (remaining.size > 0) {
+		const start = remaining.values().next().value as string;
+		const pending = [start];
+		const component: DerivedTaskNode[] = [];
+		while (pending.length > 0) {
+			const id = pending.pop()!;
+			if (!remaining.delete(id)) continue;
+			const node = nodeById.get(id);
+			if (node) component.push(node);
+			pending.push(...(neighbors.get(id) ?? []));
+		}
+		component.sort(compareTaskOrder);
+		components.push(component);
+	}
+	components.sort((a, b) => compareTaskOrder(a[0], b[0]));
 
-	const groups = new Map<number, DerivedTaskNode[]>();
-	connected.forEach((node) => {
-		const layer = layerById.get(node.id) ?? 0;
-		const group = groups.get(layer) ?? [];
-		group.push(node);
-		groups.set(layer, group);
-	});
-	const branchOrderById = new Map<string, number>();
-	Array.from(groups.keys())
-		.sort((a, b) => a - b)
-		.forEach((layer) => {
-			const group = groups.get(layer)!;
-			group.sort((a, b) => {
+	let componentTop = PADDING;
+	components.forEach((component, layoutGroup) => {
+		const componentIds = new Set(component.map((node) => node.id));
+		const componentEdges = validEdges.filter((edge) => (
+			componentIds.has(edge.sourceId) && componentIds.has(edge.targetId)
+		));
+		const incoming = new Map(component.map((node) => [node.id, [] as string[]]));
+		componentEdges
+			.filter((edge) => !cycleIds.has(edge.sourceId) && !cycleIds.has(edge.targetId))
+			.forEach((edge) => incoming.get(edge.targetId)?.push(edge.sourceId));
+
+		const layerById = new Map<string, number>();
+		const resolveLayer = (id: string): number => {
+			const existing = layerById.get(id);
+			if (existing !== undefined) return existing;
+			const dependencies = incoming.get(id) ?? [];
+			const layer = dependencies.length === 0
+				? 0
+				: Math.max(...dependencies.map((dependencyId) => resolveLayer(dependencyId))) + 1;
+			layerById.set(id, layer);
+			return layer;
+		};
+		component.filter((node) => !cycleIds.has(node.id)).forEach((node) => resolveLayer(node.id));
+		const maxNormalLayer = Math.max(0, ...Array.from(layerById.values()));
+		component.filter((node) => cycleIds.has(node.id)).forEach((node) => {
+			layerById.set(node.id, maxNormalLayer + 1);
+		});
+
+		const layers = new Map<number, DerivedTaskNode[]>();
+		component.forEach((node) => {
+			const layer = layerById.get(node.id) ?? 0;
+			const values = layers.get(layer) ?? [];
+			values.push(node);
+			layers.set(layer, values);
+		});
+		const branchOrderById = new Map<string, number>();
+		Array.from(layers.keys()).sort((a, b) => a - b).forEach((layer) => {
+			const values = layers.get(layer)!;
+			values.sort((a, b) => {
 				const parentOrder = (node: DerivedTaskNode): number => {
 					const orders = (incoming.get(node.id) ?? [])
 						.map((parentId) => branchOrderById.get(parentId))
@@ -82,34 +111,31 @@ export function layoutGraph(nodes: DerivedTaskNode[], edges: TaskEdge[]): Layout
 						? orders.reduce((sum, order) => sum + order, 0) / orders.length
 						: Number.MAX_SAFE_INTEGER;
 				};
-				const orderDifference = parentOrder(a) - parentOrder(b);
-				return orderDifference || compareTaskOrder(a, b);
+				return parentOrder(a) - parentOrder(b) || compareTaskOrder(a, b);
 			});
-			group.forEach((node, index) => branchOrderById.set(node.id, index));
+			values.forEach((node, index) => branchOrderById.set(node.id, index));
 		});
 
-	const maxRows = Math.max(1, ...Array.from(groups.values(), (group) => group.length));
-	const connectedHeight = connected.length === 0
-		? 0
-		: maxRows * NODE_HEIGHT + Math.max(0, maxRows - 1) * ROW_GAP;
-	const positioned: PositionedTaskNode[] = [];
-
-	groups.forEach((group, layer) => {
-		const groupHeight = group.length * NODE_HEIGHT + Math.max(0, group.length - 1) * ROW_GAP;
-		const startY = PADDING + (connectedHeight - groupHeight) / 2;
-		group.forEach((node, index) => {
-			positioned.push({
+		const maxRows = Math.max(1, ...Array.from(layers.values(), (values) => values.length));
+		const componentHeight = maxRows * NODE_HEIGHT + Math.max(0, maxRows - 1) * ROW_GAP;
+		layers.forEach((values, layer) => {
+			const layerHeight = values.length * NODE_HEIGHT + Math.max(0, values.length - 1) * ROW_GAP;
+			const startY = componentTop + (componentHeight - layerHeight) / 2;
+			values.forEach((node, index) => positioned.push({
 				...node,
 				x: PADDING + layer * (NODE_WIDTH + COLUMN_GAP),
 				y: startY + index * (NODE_HEIGHT + ROW_GAP),
 				width: NODE_WIDTH,
 				height: NODE_HEIGHT,
 				layer,
-			});
+				layoutGroup,
+			}));
 		});
+		componentTop += componentHeight + COMPONENT_GAP;
 	});
 
-	const isolatedStartY = PADDING + connectedHeight + (connected.length > 0 && isolated.length > 0 ? 96 : 0);
+	const connectedBottom = components.length > 0 ? componentTop - COMPONENT_GAP : PADDING;
+	const isolatedStartY = connectedBottom + (components.length > 0 && isolated.length > 0 ? 96 : 0);
 	isolated.forEach((node, index) => {
 		const column = index % ISOLATED_COLUMNS;
 		const row = Math.floor(index / ISOLATED_COLUMNS);
@@ -120,6 +146,7 @@ export function layoutGraph(nodes: DerivedTaskNode[], edges: TaskEdge[]): Layout
 			width: NODE_WIDTH,
 			height: NODE_HEIGHT,
 			layer: -1,
+			layoutGroup: components.length,
 		});
 	});
 

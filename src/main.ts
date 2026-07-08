@@ -21,6 +21,26 @@ export default class TaskGraphPlugin extends Plugin {
 			name: '打开项目任务图',
 			callback: () => void this.activateView(),
 		});
+		this.addCommand({
+			id: 'undo-task-graph',
+			name: '撤销 Task Graph 操作',
+			checkCallback: (checking) => {
+				const view = this.activeTaskGraphView();
+				if (!view?.canUndo()) return false;
+				if (!checking) void view.undo();
+				return true;
+			},
+		});
+		this.addCommand({
+			id: 'redo-task-graph',
+			name: '重做 Task Graph 操作',
+			checkCallback: (checking) => {
+				const view = this.activeTaskGraphView();
+				if (!view?.canRedo()) return false;
+				if (!checking) void view.redo();
+				return true;
+			},
+		});
 
 		this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
 			this.pendingScopePath = renamePathValue(this.pendingScopePath, oldPath, file.path);
@@ -42,6 +62,13 @@ export default class TaskGraphPlugin extends Plugin {
 			await leaf.setViewState({ type: TASK_GRAPH_VIEW, active: true });
 		}
 		this.app.workspace.revealLeaf(leaf);
+	}
+
+	private activeTaskGraphView(): TaskGraphView | null {
+		const active = this.app.workspace.getMostRecentLeaf()?.view;
+		if (active instanceof TaskGraphView) return active;
+		const leaf = this.app.workspace.getLeavesOfType(TASK_GRAPH_VIEW)[0];
+		return leaf?.view instanceof TaskGraphView ? leaf.view : null;
 	}
 
 	getActiveMap(): TaskMapConfig {

@@ -254,6 +254,11 @@
 	color: var(--tgf-text);
 }
 
+.tgf-icon-button:disabled {
+	opacity: 0.38;
+	cursor: not-allowed;
+}
+
 .tgf-icon-button.is-active {
 	color: var(--tgf-accent);
 }
@@ -548,6 +553,10 @@
 	pointer-events: none;
 }
 
+.tgf-node-layer {
+	pointer-events: none;
+}
+
 .tgf-edge {
 	fill: none;
 	stroke: color-mix(in srgb, var(--text-muted) 58%, transparent);
@@ -563,6 +572,7 @@
 	position: absolute;
 	display: flex;
 	flex-direction: column;
+	pointer-events: auto;
 	box-sizing: border-box;
 	padding: 11px 12px 10px;
 	overflow: hidden;
@@ -675,14 +685,17 @@
 	opacity: 0.9;
 }
 
-.tgf-edge.is-interactive {
-	pointer-events: stroke;
-	cursor: pointer;
-}
-
-.tgf-edge.is-interactive:hover {
+.tgf-edge.is-hovered {
 	stroke: var(--tgf-accent);
 	stroke-width: 2.5;
+}
+
+.tgf-edge-hit {
+	fill: none;
+	stroke: rgba(0, 0, 0, 0.001);
+	stroke-width: 14;
+	pointer-events: stroke;
+	cursor: context-menu;
 }
 
 .tgf-node-quick-actions {

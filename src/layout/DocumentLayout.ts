@@ -12,6 +12,7 @@ const CONTENT_OFFSET = 52;
 const TASK_UNIT_GAP = 46;
 const COLLISION_GAP = 24;
 const PADDING = 72;
+const COMPONENT_CONTENT_GAP = 120;
 
 export interface TaskDocumentLayout {
 	tasks: PositionedTaskNode[];
@@ -66,11 +67,12 @@ export function layoutTaskDocuments(
 
 	const tasks = taskLayout.nodes.map((node) => ({ ...node }));
 	if (reserveTaskSpace) {
-		const layers = new Map<number, PositionedTaskNode[]>();
+		const layers = new Map<string, PositionedTaskNode[]>();
 		tasks.forEach((task) => {
-			const layer = layers.get(task.layer) ?? [];
+			const key = `${task.layoutGroup}:${task.layer}`;
+			const layer = layers.get(key) ?? [];
 			layer.push(task);
-			layers.set(task.layer, layer);
+			layers.set(key, layer);
 		});
 		layers.forEach((layer) => {
 			layer.sort((a, b) => a.y - b.y);
@@ -85,6 +87,33 @@ export function layoutTaskDocuments(
 				cursor = task.y + task.height + contentHeight + TASK_UNIT_GAP;
 			});
 		});
+
+		const componentBounds = new Map<number, { minY: number; maxY: number }>();
+		tasks.forEach((task) => {
+			const documentCount = privateDocuments.get(task.id)?.length ?? 0;
+			const contentBottom = documentCount > 0
+				? task.y + task.height + CONTENT_OFFSET
+					+ documentCount * DOCUMENT_HEIGHT
+					+ Math.max(0, documentCount - 1) * DOCUMENT_GAP
+				: task.y + task.height;
+			const bounds = componentBounds.get(task.layoutGroup);
+			componentBounds.set(task.layoutGroup, {
+				minY: Math.min(bounds?.minY ?? task.y, task.y),
+				maxY: Math.max(bounds?.maxY ?? contentBottom, contentBottom),
+			});
+		});
+		let cursor = PADDING;
+		Array.from(componentBounds.entries())
+			.sort((a, b) => a[1].minY - b[1].minY)
+			.forEach(([layoutGroup, bounds]) => {
+				const shift = Math.max(0, cursor - bounds.minY);
+				if (shift > 0) {
+					tasks
+						.filter((task) => task.layoutGroup === layoutGroup)
+						.forEach((task) => { task.y += shift; });
+				}
+				cursor = bounds.maxY + shift + COMPONENT_CONTENT_GAP;
+			});
 	}
 
 	const taskById = new Map(tasks.map((task) => [task.id, task]));

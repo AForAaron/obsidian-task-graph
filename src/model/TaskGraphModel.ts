@@ -53,6 +53,8 @@ export interface PositionedTaskNode extends DerivedTaskNode {
 	width: number;
 	height: number;
 	layer: number;
+	/** Weakly connected task component used to keep independent trees in separate lanes. */
+	layoutGroup: number;
 }
 
 export interface DocumentNode {

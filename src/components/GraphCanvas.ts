@@ -524,15 +524,28 @@ export class GraphCanvas {
 			const endX = target.x - portOffset;
 			const endY = target.y + target.height / 2;
 			const distance = Math.max(52, Math.abs(endX - startX) * 0.48);
+			const curve = `M ${startX} ${startY} C ${startX + distance} ${startY}, ${endX - distance} ${endY}, ${endX} ${endY}`;
 			const path = document.createElementNS(SVG_NS, 'path');
-			path.addClass('tgf-edge', 'is-interactive');
-			path.setAttribute('d', `M ${startX} ${startY} C ${startX + distance} ${startY}, ${endX - distance} ${endY}, ${endX} ${endY}`);
+			path.addClass('tgf-edge');
+			path.setAttribute('d', curve);
 			path.setAttribute('marker-end', 'url(#tgf-arrow)');
-			path.addEventListener('click', (event) => {
+			const hitPath = document.createElementNS(SVG_NS, 'path');
+			hitPath.addClass('tgf-edge-hit');
+			hitPath.setAttribute('d', curve);
+			hitPath.addEventListener('pointerenter', () => path.addClass('is-hovered'));
+			hitPath.addEventListener('pointerleave', () => path.removeClass('is-hovered'));
+			hitPath.addEventListener('contextmenu', (event) => {
+				event.preventDefault();
 				event.stopPropagation();
-				this.options.onRemoveRelationship(source, target);
+				const menu = new Menu();
+				menu.addItem((item) => item
+					.setTitle(`解除上下级关系：${source.text} → ${target.text}`)
+					.setIcon('unlink')
+					.onClick(() => this.options.onRemoveRelationship(source, target)));
+				menu.showAtMouseEvent(event);
 			});
 			svg.appendChild(path);
+			svg.appendChild(hitPath);
 		});
 		this.documentEdges.forEach((edge) => {
 			const task = nodeById.get(edge.taskNodeId);

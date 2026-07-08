@@ -7,6 +7,7 @@ import { migratePluginData, renamePathValue, renameSourcePaths } from '../src/se
 import { taskPositionKey } from '../src/services/TaskParser';
 import { resolveSourcePathRules } from '../src/services/SourceRules';
 import { runSuccessorWriteTransaction } from '../src/services/WriteTransaction';
+import { HistoryManager, HistorySnapshot } from '../src/services/HistoryManager';
 import {
 	addDependency,
 	addDocumentLink,
@@ -35,6 +36,14 @@ function assert(condition: boolean, message: string): void {
 	assertionCount += 1;
 	if (!condition) throw new Error(message);
 }
+
+const canvasStyles = readFileSync('src/styles/main.css', 'utf8');
+assert(
+	/\.tgf-node-layer\s*\{[^}]*pointer-events:\s*none/s.test(canvasStyles)
+		&& /\.tgf-node\s*\{[^}]*pointer-events:\s*auto/s.test(canvasStyles)
+		&& /\.tgf-edge-hit\s*\{[^}]*pointer-events:\s*stroke/s.test(canvasStyles),
+	'节点透明容器应允许事件穿透，同时保留节点和依赖线命中区域',
+);
 
 const sample = [
 	'- [ ] 项目根 🆔 root001',
@@ -245,6 +254,65 @@ assert(
 const isolated = layout.nodes.find((node) => node.taskId === 'research01');
 assert(Boolean(isolated && isolated.layer === -1), '无关联任务应进入独立网格区域');
 
+const forestTasks = parseTaskFile('forest.md', [
+	'- [ ] 树 A 根 🆔 treea0',
+	'- [ ] 树 A 子 🆔 treea1 ⛔ treea0',
+	'- [ ] 树 A 孙 🆔 treea2 ⛔ treea1',
+	'- [ ] 树 B 根 🆔 treeb0',
+	'- [ ] 树 B 子 🆔 treeb1 ⛔ treeb0',
+].join('\n'));
+const forestGraph = buildTaskGraph(forestTasks);
+const forestLayout = layoutGraph(forestGraph.nodes, forestGraph.edges);
+const treeANodes = forestLayout.nodes.filter((node) => node.taskId?.startsWith('treea'));
+const treeBNodes = forestLayout.nodes.filter((node) => node.taskId?.startsWith('treeb'));
+assert(
+	new Set(treeANodes.map((node) => node.layoutGroup)).size === 1
+		&& new Set(treeBNodes.map((node) => node.layoutGroup)).size === 1
+		&& treeANodes[0].layoutGroup !== treeBNodes[0].layoutGroup,
+	'互不相连的任务树应进入不同布局分组',
+);
+assert(
+	Math.max(...treeANodes.map((node) => node.y + node.height))
+		< Math.min(...treeBNodes.map((node) => node.y)),
+	'完整任务树应占据互不重叠的上下泳道',
+);
+const forestWithDocument = layoutTaskDocuments(
+	forestLayout,
+	[{
+		id: 'doc:tree-a.md',
+		nodeType: 'document',
+		path: 'tree-a.md',
+		title: '树 A 内容',
+		excerpt: '',
+		wordCount: 0,
+		checklistDone: 0,
+		checklistTotal: 0,
+		mtime: 0,
+		linkedTaskIds: [forestGraph.nodes[0].id],
+		missing: false,
+	}],
+	new Set(['tree-a.md']),
+	true,
+);
+const treeADocument = forestWithDocument.documents[0];
+const shiftedTreeB = forestWithDocument.tasks.filter((node) => node.taskId?.startsWith('treeb'));
+assert(
+	treeADocument.y + treeADocument.height < Math.min(...shiftedTreeB.map((node) => node.y)),
+	'展开的私有内容卡应计入所属树高度，不得侵入下一棵树',
+);
+
+const joinedDagTasks = parseTaskFile('joined-dag.md', [
+	'- [ ] 根一 🆔 roota1',
+	'- [ ] 根二 🆔 roota2',
+	'- [ ] 汇合 🆔 joined1 ⛔ roota1,roota2',
+].join('\n'));
+const joinedDagGraph = buildTaskGraph(joinedDagTasks);
+const joinedDagLayout = layoutGraph(joinedDagGraph.nodes, joinedDagGraph.edges);
+assert(
+	new Set(joinedDagLayout.nodes.map((node) => node.layoutGroup)).size === 1,
+	'通过汇合节点连接的多根 DAG 应作为同一布局分量',
+);
+
 const cycleTasks = parseTaskFile('cycle.md', [
 	'- [ ] A 🆔 aaa ⛔ bbb',
 	'- [ ] B 🆔 bbb ⛔ aaa',
@@ -402,6 +470,89 @@ async function testSuccessorRollback(): Promise<void> {
 	);
 }
 
+function snapshot(value: string): HistorySnapshot {
+	return { files: { 'Plan.md': value }, maps: {} };
+}
+
+async function testHistoryManager(): Promise<void> {
+	const history = new HistoryManager(50);
+	history.record('map-a', {
+		label: '建立任务关系',
+		before: snapshot('before'),
+		after: snapshot('after'),
+	});
+	assert(history.canUndo('map-a'), '记录操作后应允许撤销');
+	assert(!history.canUndo('map-b'), '不同地图的历史应相互隔离');
+	let conflictRaised = false;
+	try {
+		await history.undo('map-a', async () => {
+			throw new Error('external conflict');
+		});
+	} catch {
+		conflictRaised = true;
+	}
+	assert(
+		conflictRaised && history.canUndo('map-a') && !history.canRedo('map-a'),
+		'恢复回调失败时应保留原撤销项且不得生成重做项',
+	);
+	let applied = '';
+	const undone = await history.undo('map-a', async (expected, target) => {
+		assert(expected.files['Plan.md'] === 'after', '撤销应校验操作后的状态');
+		assert(target.files['Plan.md'] === 'before', '撤销应恢复操作前的状态');
+		applied = target.files['Plan.md'] ?? '';
+	});
+	assert(undone?.label === '建立任务关系' && applied === 'before', '撤销应返回被撤销的历史项');
+	assert(history.canRedo('map-a'), '撤销后应允许重做');
+	await history.redo('map-a', async (expected, target) => {
+		assert(expected.files['Plan.md'] === 'before', '重做应校验撤销后的状态');
+		applied = target.files['Plan.md'] ?? '';
+	});
+	assert(applied === 'after', '重做应恢复操作后的状态');
+
+	history.record('map-a', {
+		label: '编辑内容',
+		before: snapshot('after'),
+		after: snapshot('edit-1'),
+		coalesceKey: 'editor:Plan.md',
+	});
+	history.record('map-a', {
+		label: '编辑内容',
+		before: snapshot('edit-1'),
+		after: snapshot('edit-2'),
+		coalesceKey: 'editor:Plan.md',
+	});
+	await history.undo('map-a', async (expected, target) => {
+		assert(expected.files['Plan.md'] === 'edit-2', '合并历史应保留最后一次编辑结果');
+		assert(target.files['Plan.md'] === 'after', '合并历史应恢复到整次编辑会话之前');
+	});
+
+	for (let index = 0; index < 55; index += 1) {
+		history.record('limited', {
+			label: `操作 ${index}`,
+			before: snapshot(String(index)),
+			after: snapshot(String(index + 1)),
+		});
+	}
+	let undoCount = 0;
+	while (history.canUndo('limited')) {
+		await history.undo('limited', async () => { undoCount += 1; });
+	}
+	assert(undoCount === 50, '每张地图最多应保留 50 步撤销历史');
+
+	history.record('redo-clear', {
+		label: '第一步',
+		before: snapshot('0'),
+		after: snapshot('1'),
+	});
+	await history.undo('redo-clear', async () => {});
+	history.record('redo-clear', {
+		label: '新操作',
+		before: snapshot('0'),
+		after: snapshot('2'),
+	});
+	assert(!history.canRedo('redo-clear'), '撤销后执行新操作应清空重做栈');
+}
+
 const targetPath = process.argv[2];
 if (targetPath) {
 	const actualTasks = parseTaskFile(targetPath, readFileSync(targetPath, 'utf8'));
@@ -417,6 +568,6 @@ if (targetPath) {
 	}, null, 2));
 }
 
-void testSuccessorRollback().then(() => {
+void Promise.all([testSuccessorRollback(), testHistoryManager()]).then(() => {
 	console.log(`Task Graph core tests passed (${assertionCount} assertions).`);
 });
