@@ -3,10 +3,10 @@ import { copyFileSync, existsSync } from "fs";
 
 const hasLocalDependencies = existsSync(new URL("./node_modules/esbuild", import.meta.url));
 const esbuildModule = await import(
-	hasLocalDependencies ? "esbuild" : "../TimeGrid/node_modules/esbuild/lib/main.js"
+	hasLocalDependencies ? "esbuild" : "../obsidian-time-grid/node_modules/esbuild/lib/main.js"
 );
 const builtinsModule = await import(
-	hasLocalDependencies ? "builtin-modules" : "../TimeGrid/node_modules/builtin-modules/index.js"
+	hasLocalDependencies ? "builtin-modules" : "../obsidian-time-grid/node_modules/builtin-modules/index.js"
 );
 const esbuild = esbuildModule.default ?? esbuildModule;
 const builtins = builtinsModule.default ?? builtinsModule;

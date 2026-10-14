@@ -14,7 +14,7 @@
 		"paths": {
 			"obsidian": [
 				"node_modules/obsidian",
-				"../TimeGrid/node_modules/obsidian"
+				"../obsidian-time-grid/node_modules/obsidian"
 			]
 		}
 	},

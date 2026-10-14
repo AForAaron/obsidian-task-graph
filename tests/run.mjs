@@ -6,7 +6,7 @@ import { fileURLToPath } from 'url';
 
 const hasLocalDependencies = existsSync(new URL('../node_modules/esbuild', import.meta.url));
 const esbuildModule = await import(
-	hasLocalDependencies ? 'esbuild' : '../../TimeGrid/node_modules/esbuild/lib/main.js'
+	hasLocalDependencies ? 'esbuild' : '../../obsidian-time-grid/node_modules/esbuild/lib/main.js'
 );
 const esbuild = esbuildModule.default ?? esbuildModule;
 const testsDirectory = dirname(fileURLToPath(import.meta.url));
