@@ -1,4 +1,43 @@
-# Task Graph
+# Task Graph · Obsidian 插件
+
+> 任务依赖关系可视化插件：限定 Markdown 来源、图形化编辑任务、自动布局，多地图视图与位置持久化。
+
+## 这是什么
+
+把 Markdown 里的任务抽成一张依赖关系图：任务之间的先后关系可视化，可以直接在图上编辑，支持自动布局，多张地图各自记住自己的视图位置。
+
+## 状态
+
+- **阶段**：v0.4.0 · 早期阶段（README 中作者自己标注了这一点）
+- **已完成**：任务抓取（可限定 Markdown 来源）、依赖图渲染、图形化编辑、自动布局、多地图视图与位置持久化
+- **已知缺口**：早期版本，接口与数据结构可能变动
+
+## 开发
+
+```bash
+npm install
+npm test
+npm run build        # esbuild 打包
+```
+
+## 结构
+
+```text
+src/                插件源码
+tests/              测试
+DESIGN.md           设计说明
+PROJECT_CONTEXT.md  开发日志（内部记录）
+esbuild.config.mjs  构建配置
+```
+
+## 数据与隐私
+
+只读写你 vault 内的 Markdown 文件，不联网。任务依赖以 Markdown 语法表达，卸载插件不会损坏笔记内容。
+
+<!-- readme-skeleton: 顶部为统一骨架，其下为原文，未删减 -->
+
+---
+
 
 Task Graph 是一款面向 Obsidian 的可编辑任务依赖图插件。它把 Markdown 中的
 [Obsidian Tasks](https://github.com/obsidian-tasks-group/obsidian-tasks) 任务组织成多张独立地图，
